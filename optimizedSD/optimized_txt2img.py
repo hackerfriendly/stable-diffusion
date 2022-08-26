@@ -14,6 +14,43 @@ from torch import autocast
 from contextlib import contextmanager, nullcontext
 from ldm.util import instantiate_from_config
 
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+from transformers import AutoFeatureExtractor
+
+# load safety model
+safety_model_id = "CompVis/stable-diffusion-safety-checker"
+safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+
+def load_replacement(x):
+    try:
+        hwc = x.shape
+        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
+        y = (np.array(y)/255.0).astype(x.dtype)
+        assert y.shape == x.shape
+        return y
+    except Exception:
+        return x
+
+def numpy_to_pil(images):
+    """
+    Convert a numpy image or a batch of images to a PIL image.
+    """
+    if images.ndim == 3:
+        images = images[None, ...]
+    images = (images * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
+
+    return pil_images
+
+def check_safety(x_image):
+    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
+    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
+    assert x_checked_image.shape[0] == len(has_nsfw_concept)
+    for i in range(len(has_nsfw_concept)):
+        if has_nsfw_concept[i]:
+            x_checked_image[i] = load_replacement(x_checked_image[i])
+    return x_checked_image, has_nsfw_concept
 
 def chunk(it, size):
     it = iter(it)
@@ -262,6 +299,15 @@ with torch.no_grad():
                     
                     x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
                     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                    # do the safety dance!
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                    x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+
+                    # substitute
+                    x_sample = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+
                 # for x_sample in x_samples_ddim:
                     x_sample = 255. * rearrange(x_sample[0].cpu().numpy(), 'c h w -> h w c')
                     Image.fromarray(x_sample.astype(np.uint8)).save(
