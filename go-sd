@@ -37,9 +37,14 @@ cd $(dirname $0)
 TMPDIR=$(mktemp -d)
 
 export PYTHONPATH=.:taming-transformers:CLIP
-export GEN="${PROMPT} ${STYLE}"
 
-python3 optimizedSD/optimized_txt2img.py --H ${HEIGHT} --W ${WIDTH} --seed ${SEED} --n_iter 1 --ddim_steps 50 --skip_grid --n_samples 1 --outdir ${TMPDIR} --prompt "${GEN}" --small_batch
+if [ ! -z "${STYLE}" ]; then
+  export GEN="${PROMPT} by ${STYLE}"
+else
+  export GEN="${PROMPT}"
+fi
+
+python3 optimizedSD/optimized_txt2img.py --H ${HEIGHT} --W ${WIDTH} --seed ${SEED} --n_iter 1 --ddim_steps 50 --skip_grid --n_samples 1 --outdir ${TMPDIR} --prompt "${GEN}"
 
 # Now for upscaling
 # deactivate
