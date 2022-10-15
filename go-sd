@@ -39,7 +39,7 @@ TMPDIR=$(mktemp -d)
 export PYTHONPATH=.:taming-transformers:CLIP
 export GEN="${PROMPT} ${STYLE}"
 
-python3 optimizedSD/optimized_txt2img.py --H ${HEIGHT} --W ${WIDTH} --seed ${SEED} --n_iter 1 --ddim_steps 50 --skip_grid --n_samples 1 --outdir ${TMPDIR} --prompt "${GEN}" --small_batch
+python3 huggingface-sd.py --height ${HEIGHT} --width ${WIDTH} --seed ${SEED} --steps 30 --samples 1 --outdir ${TMPDIR} --prompt "${GEN}"
 
 # Now for upscaling
 # deactivate
@@ -48,7 +48,7 @@ python3 optimizedSD/optimized_txt2img.py --H ${HEIGHT} --W ${WIDTH} --seed ${SEE
 
 # python inference_realesrgan.py --face_enhance -n RealESRGAN_x4plus -i ${TMPDIR}/samples/0000.png -o ${TMPDIR}
 
-convert ${TMPDIR}/*/00000.png ${OUTFILE}
+mv ${TMPDIR}/00000.jpg ${OUTFILE}
 
 exiftool -overwrite_original -description="${PROMPT}" -software='Stable Diffusion v1.4' -make="--seed ${SEED}" -artist="${STYLE}" ${OUTFILE}
 
