@@ -37,9 +37,14 @@ cd $(dirname $0)
 TMPDIR=$(mktemp -d)
 
 export PYTHONPATH=.:taming-transformers:CLIP
-export GEN="${PROMPT} ${STYLE}"
 
 python3 huggingface-sd.py --height ${HEIGHT} --width ${WIDTH} --seed ${SEED} --steps 30 --samples 1 --outdir ${TMPDIR} --prompt "${GEN}"
+
+if [ ! -z "${STYLE}" ]; then
+  export GEN="${PROMPT} by ${STYLE}"
+else
+  export GEN="${PROMPT}"
+fi
 
 # Now for upscaling
 # deactivate
