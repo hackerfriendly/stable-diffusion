@@ -6,8 +6,6 @@ Pre-load the model and serve image prompts via FastAPI.
 Reduces rendering time from 1:20 to about 3.5 seconds on an RTX 2080.
 '''
 import random
-import uuid
-import tempfile
 
 from pathlib import Path
 from threading import Lock
@@ -15,7 +13,6 @@ from typing import Optional
 from io import BytesIO
 
 import torch
-import exif
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
@@ -123,25 +120,22 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
     image = (image / 2 + 0.5).clamp(0, 1)
     image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
     images = (image * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
+
+    out = Image.fromarray(images[0])
+
+    # Set the EXIF data. See PIL.ExifTags.TAGS to map numbers to names.
+    exif = out.getexif()
+    exif[271] = prompt # Make
+    exif[272] = 'Stable Diffusion v1.4' # Model
+    exif[305] = f'seed={seed}, steps={steps}' # Software
 
     buf = BytesIO()
-    pil_images[0].save(buf, format="JPEG", quality=100)
+    out.save(buf, format="JPEG", quality=85, exif=exif)
 
-    buf.seek(0)
-    meta = exif.Image(buf)
-    meta.model = 'Stable Diffusion v1.4'
-    meta.software = f'seed={seed}, steps={steps}'
-    meta.make = prompt
-
-    with open('out.jpg', 'wb') as f:
-        f.write(meta.get_file())
-
-    buf.write(meta.get_file())
     buf.seek(0)
 
     return StreamingResponse(buf, media_type="image/jpeg", headers={
-        'Content-Disposition': 'inline; filename="out.jpg"'}
+        'Content-Disposition': 'inline; filename="synthesis.jpg"'}
     )
 
 @app.get("/")
@@ -157,14 +151,13 @@ async def generate(
     width: Optional[int] = Query(512),
     height: Optional[int] = Query(512),
     ):
-    ''' Make an image and return it '''
+    ''' Generate an image with Stable Diffusion '''
 
     if width * height > 287744:
         raise HTTPException(
             status_code=422,
             detail='Out of GPU memory. Total width * height must be < 287744 pixels.'
         )
-
 
     if seed < 0:
         seed = random.randint(0,2**64-1)
