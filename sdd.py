@@ -7,7 +7,6 @@ Reduces rendering time from 1:20 to about 3.5 seconds on an RTX 2080.
 '''
 import random
 
-from pathlib import Path
 from threading import Lock
 from typing import Optional
 from io import BytesIO
@@ -26,11 +25,16 @@ from PIL import Image
 
 app = FastAPI()
 
+# Every GPU device that can be used for image generation
+GPUS = {
+    "0": {"name": "RTX 2080 Ti", "lock": Lock()},
+}
+
 # Supress some unnecessary warnings when loading the CLIPTextModel
 logging.set_verbosity_error()
 
-# Set device
-torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+if not torch.cuda.is_available():
+    raise RuntimeError('No CUDA device available, exiting.')
 
 # Load the autoencoder model which will be used to decode the latents into image space.
 vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=True)
@@ -51,12 +55,19 @@ scheduler = LMSDiscreteScheduler(
 )
 
 # To the GPU we go!
-vae = vae.to(torch_device)
-text_encoder = text_encoder.to(torch_device)
-unet = unet.to(torch_device)
+vae = vae.to('cuda')
+text_encoder = text_encoder.to('cuda')
+unet = unet.to('cuda')
+
+def wait_for_gpu():
+    ''' Return the device name of first available GPU. Blocks until one is available and sets the lock. '''
+    while True:
+        gpu = random.choice(list(GPUS))
+        if GPUS[gpu]['lock'].acquire(timeout=1):
+            return gpu
 
 def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
-    # Some settings
+    ''' Generate an image. Returns a FastAPI StreamingResponse. '''
     generator = torch.manual_seed(seed)
     batch_size = 1
 
@@ -69,39 +80,35 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
         return_tensors="pt"
     )
     with torch.no_grad():
-        text_embeddings = text_encoder(text_input.input_ids.to(torch_device))[0]
+        text_embeddings = text_encoder(text_input.input_ids.to('cuda'))[0]
     max_length = text_input.input_ids.shape[-1]
     uncond_input = tokenizer(
         [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
     )
     with torch.no_grad():
-        uncond_embeddings = text_encoder(uncond_input.input_ids.to(torch_device))[0]
-    text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+        uncond_embeddings = text_encoder(uncond_input.input_ids.to('cuda'))[0]
+    text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # pylint: disable=no-member
 
     # Prep Scheduler
     scheduler.set_timesteps(steps)
 
     # Prep latents
-    latents = torch.randn(
+    latents = torch.randn( # pylint: disable=no-member
       (batch_size, unet.in_channels, height // 8, width // 8),
       generator=generator,
     )
-    latents = latents.to(torch_device)
+    latents = latents.to('cuda')
     latents = latents * scheduler.init_noise_sigma
 
     # Loop
     with autocast("cuda"):
-        for i, t in tqdm(enumerate(scheduler.timesteps)):
+        for _, ts in tqdm(enumerate(scheduler.timesteps)):
             # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-            latent_model_input = torch.cat([latents] * 2)
-            sigma = scheduler.sigmas[i]
-            # Scale the latents (preconditioning):
-            # latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5) # Diffusers 0.3 and below
-            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+            latent_model_input = scheduler.scale_model_input(torch.cat([latents] * 2), ts) # pylint: disable=no-member
 
             # predict the noise residual
             with torch.no_grad():
-                noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                noise_pred = unet(latent_model_input, ts, encoder_hidden_states=text_embeddings).sample
 
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -109,7 +116,7 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
 
             # compute the previous noisy sample x_t -> x_t-1
             # latents = scheduler.step(noise_pred, i, latents)["prev_sample"] # Diffusers 0.3 and below
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            latents = scheduler.step(noise_pred, ts, latents).prev_sample
 
     # scale and decode the image latents with vae
     latents = 1 / 0.18215 * latents
@@ -164,4 +171,8 @@ async def generate(
 
     prompt = prompt.strip().replace('\n', ' ')
 
-    return generate_image(prompt, seed, steps, width, height)
+    gpu = wait_for_gpu()
+    try:
+        return generate_image(prompt, seed, steps, width, height)
+    finally:
+        GPUS[gpu]['lock'].release()
