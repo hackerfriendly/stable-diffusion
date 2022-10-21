@@ -30,6 +30,9 @@ GPUS = {
     "0": {"name": "RTX 2080 Ti", "lock": Lock()},
 }
 
+# MODEL = "CompVis/stable-diffusion-v1-4"
+MODEL = "runwayml/stable-diffusion-v1-5"
+
 # Supress some unnecessary warnings when loading the CLIPTextModel
 logging.set_verbosity_error()
 
@@ -37,14 +40,14 @@ if not torch.cuda.is_available():
     raise RuntimeError('No CUDA device available, exiting.')
 
 # Load the autoencoder model which will be used to decode the latents into image space.
-vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=True)
+vae = AutoencoderKL.from_pretrained(MODEL, subfolder="vae", use_auth_token=True)
 
 # Load the tokenizer and text encoder to tokenize and encode the text.
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 
 # The UNet model for generating the latents.
-unet = UNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="unet", use_auth_token=True)
+unet = UNet2DConditionModel.from_pretrained(MODEL, subfolder="unet", use_auth_token=True)
 
 # The noise scheduler
 scheduler = LMSDiscreteScheduler(
@@ -132,9 +135,9 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
 
     # Set the EXIF data. See PIL.ExifTags.TAGS to map numbers to names.
     exif = out.getexif()
-    exif[271] = prompt # Make
-    exif[272] = 'Stable Diffusion v1.4' # Model
-    exif[305] = f'seed={seed}, steps={steps}' # Software
+    exif[271] = prompt # exif: Make
+    exif[272] = MODEL # exif: Model
+    exif[305] = f'seed={seed}, steps={steps}' # exif: Software
 
     buf = BytesIO()
     out.save(buf, format="JPEG", quality=85, exif=exif)
