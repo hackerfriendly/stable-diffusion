@@ -31,7 +31,24 @@ GPUS = {
 }
 
 # MODEL = "CompVis/stable-diffusion-v1-4"
-MODEL = "runwayml/stable-diffusion-v1-5"
+MODELS = {
+    "unet": {
+        "name": "runwayml/stable-diffusion-v1-5",
+        "subfolder": "unet"
+    },
+    "vae": {
+        "name": "stabilityai/sd-vae-ft-ema",
+        "subfolder": ""
+    },
+    "tokenizer": {
+        "name": "openai/clip-vit-large-patch14",
+        "subfolder": ""
+    },
+    "text_encoder": {
+        "name": "openai/clip-vit-large-patch14",
+        "subfolder": ""
+    }
+}
 
 # Supress some unnecessary warnings when loading the CLIPTextModel
 logging.set_verbosity_error()
@@ -40,14 +57,14 @@ if not torch.cuda.is_available():
     raise RuntimeError('No CUDA device available, exiting.')
 
 # Load the autoencoder model which will be used to decode the latents into image space.
-vae = AutoencoderKL.from_pretrained(MODEL, subfolder="vae", use_auth_token=True)
+vae = AutoencoderKL.from_pretrained(MODELS["vae"]["name"], subfolder=MODELS["vae"]["subfolder"], use_auth_token=True)
 
 # Load the tokenizer and text encoder to tokenize and encode the text.
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+tokenizer = CLIPTokenizer.from_pretrained(MODELS["tokenizer"]["name"], subfolder=MODELS["tokenizer"]["subfolder"])
+text_encoder = CLIPTextModel.from_pretrained(MODELS["text_encoder"]["name"], subfolder=MODELS["text_encoder"]["subfolder"])
 
 # The UNet model for generating the latents.
-unet = UNet2DConditionModel.from_pretrained(MODEL, subfolder="unet", use_auth_token=True)
+unet = UNet2DConditionModel.from_pretrained(MODELS["unet"]["name"], subfolder=MODELS["unet"]["subfolder"], use_auth_token=True)
 
 # The noise scheduler
 scheduler = LMSDiscreteScheduler(
@@ -136,7 +153,7 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
     # Set the EXIF data. See PIL.ExifTags.TAGS to map numbers to names.
     exif = out.getexif()
     exif[271] = prompt # exif: Make
-    exif[272] = MODEL # exif: Model
+    exif[272] = MODELS["unet"]["name"] # exif: Model
     exif[305] = f'seed={seed}, steps={steps}' # exif: Software
 
     buf = BytesIO()
@@ -157,7 +174,7 @@ async def root():
 async def generate(
     prompt: Optional[str] = Query(""),
     seed: Optional[int] = Query(-1),
-    steps: Optional[int] = Query(30),
+    steps: Optional[int] = Query(40),
     width: Optional[int] = Query(512),
     height: Optional[int] = Query(512),
     ):
