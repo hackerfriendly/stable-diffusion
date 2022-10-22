@@ -1,9 +1,9 @@
 '''
-sdd.py: Stable Diffusion daemon
+sdd.py: Stable Diffusion daemon. Pre-load the model and serve image prompts via FastAPI.
 
-Pre-load the model and serve image prompts via FastAPI.
+This fetches SD from Hugging Face, so huggingface-cli login first.
 
-Reduces rendering time from 1:20 to about 3.5 seconds on an RTX 2080.
+Reduces rendering time about 3.5 seconds for 40 steps on an RTX 2080.
 '''
 import random
 
@@ -13,58 +13,67 @@ from io import BytesIO
 
 import torch
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
 
-from transformers import CLIPTextModel, CLIPTokenizer
-from transformers import logging
+from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, LMSDiscreteScheduler
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+
 from tqdm.auto import tqdm
 from torch import autocast
 from PIL import Image
 
 app = FastAPI()
 
-# Every GPU device that can be used for image generation
-GPUS = {
-    "0": {"name": "RTX 2080 Ti", "lock": Lock()},
-}
-
-# MODEL = "CompVis/stable-diffusion-v1-4"
 MODELS = {
     "unet": {
+        # "name" = "CompVis/stable-diffusion-v1-4",
         "name": "runwayml/stable-diffusion-v1-5",
-        "subfolder": "unet"
+        "sub": "unet"
     },
     "vae": {
         "name": "stabilityai/sd-vae-ft-ema",
-        "subfolder": ""
+        "sub": ""
     },
     "tokenizer": {
         "name": "openai/clip-vit-large-patch14",
-        "subfolder": ""
+        "sub": ""
     },
     "text_encoder": {
         "name": "openai/clip-vit-large-patch14",
-        "subfolder": ""
+        "sub": ""
+    },
+    "safety": {
+        "name": "CompVis/stable-diffusion-safety-checker",
+        "sub": ""
     }
 }
+
+# One lock for each available GPU (only one supported for now)
+GPUS = {}
+for i in range(torch.cuda.device_count()):
+    GPUS[i] = Lock()
+
+if not GPUS:
+    raise RuntimeError("No GPUs detected. Check your config and try again.")
 
 # Supress some unnecessary warnings when loading the CLIPTextModel
 logging.set_verbosity_error()
 
-if not torch.cuda.is_available():
-    raise RuntimeError('No CUDA device available, exiting.')
-
 # Load the autoencoder model which will be used to decode the latents into image space.
-vae = AutoencoderKL.from_pretrained(MODELS["vae"]["name"], subfolder=MODELS["vae"]["subfolder"], use_auth_token=True)
+vae = AutoencoderKL.from_pretrained(MODELS["vae"]["name"], subfolder=MODELS["vae"]["sub"], use_auth_token=True)
 
 # Load the tokenizer and text encoder to tokenize and encode the text.
-tokenizer = CLIPTokenizer.from_pretrained(MODELS["tokenizer"]["name"], subfolder=MODELS["tokenizer"]["subfolder"])
-text_encoder = CLIPTextModel.from_pretrained(MODELS["text_encoder"]["name"], subfolder=MODELS["text_encoder"]["subfolder"])
+tokenizer = CLIPTokenizer.from_pretrained(MODELS["tokenizer"]["name"], subfolder=MODELS["tokenizer"]["sub"])
+text_encoder = CLIPTextModel.from_pretrained(MODELS["text_encoder"]["name"], subfolder=MODELS["text_encoder"]["sub"])
 
 # The UNet model for generating the latents.
-unet = UNet2DConditionModel.from_pretrained(MODELS["unet"]["name"], subfolder=MODELS["unet"]["subfolder"], use_auth_token=True)
+unet = UNet2DConditionModel.from_pretrained(MODELS["unet"]["name"], subfolder=MODELS["unet"]["sub"], use_auth_token=True)
+
+# The CompVis safety model.
+safety_feature_extractor = AutoFeatureExtractor.from_pretrained(MODELS["safety"]["name"], subfolder=MODELS["safety"]["sub"])
+safety_checker = StableDiffusionSafetyChecker.from_pretrained(MODELS["safety"]["name"], subfolder=MODELS["safety"]["sub"])
 
 # The noise scheduler
 scheduler = LMSDiscreteScheduler(
@@ -79,76 +88,96 @@ vae = vae.to('cuda')
 text_encoder = text_encoder.to('cuda')
 unet = unet.to('cuda')
 
+def naughty(image):
+    ''' Returns True if naughty bits are detected, else False. '''
+    safety_checker_input = safety_feature_extractor([image], return_tensors="pt")
+    _, has_nsfw_concept = safety_checker(images=[image], clip_input=safety_checker_input.pixel_values)
+    return has_nsfw_concept[0]
+
 def wait_for_gpu():
     ''' Return the device name of first available GPU. Blocks until one is available and sets the lock. '''
     while True:
         gpu = random.choice(list(GPUS))
-        if GPUS[gpu]['lock'].acquire(timeout=1):
+        if GPUS[gpu].acquire(timeout=0.5):
             return gpu
 
 def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
-    ''' Generate an image. Returns a FastAPI StreamingResponse. '''
-    generator = torch.manual_seed(seed)
-    batch_size = 1
+    ''' Generate and return an image array using the first available GPU '''
 
-    # Prep text
-    text_input = tokenizer(
-        [prompt],
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-    with torch.no_grad():
-        text_embeddings = text_encoder(text_input.input_ids.to('cuda'))[0]
-    max_length = text_input.input_ids.shape[-1]
-    uncond_input = tokenizer(
-        [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
-    )
-    with torch.no_grad():
-        uncond_embeddings = text_encoder(uncond_input.input_ids.to('cuda'))[0]
-    text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # pylint: disable=no-member
+    gpu = wait_for_gpu()
+    try:
+        # Prep text
+        text_input = tokenizer(
+            [prompt],
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        with torch.no_grad():
+            text_embeddings = text_encoder(text_input.input_ids.to('cuda'))[0]
+        max_length = text_input.input_ids.shape[-1]
+        uncond_input = tokenizer(
+            [""], padding="max_length", max_length=max_length, return_tensors="pt"
+        )
+        with torch.no_grad():
+            uncond_embeddings = text_encoder(uncond_input.input_ids.to('cuda'))[0]
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # pylint: disable=no-member
 
-    # Prep Scheduler
-    scheduler.set_timesteps(steps)
+        # Prep Scheduler
+        scheduler.set_timesteps(steps)
 
-    # Prep latents
-    latents = torch.randn( # pylint: disable=no-member
-      (batch_size, unet.in_channels, height // 8, width // 8),
-      generator=generator,
-    )
-    latents = latents.to('cuda')
-    latents = latents * scheduler.init_noise_sigma
+        # Prep latents
+        latents = torch.randn( # pylint: disable=no-member
+          (1, unet.in_channels, height // 8, width // 8),
+          generator=torch.manual_seed(seed),
+        )
+        latents = latents.to('cuda')
+        latents = latents * scheduler.init_noise_sigma
 
-    # Loop
-    with autocast("cuda"):
-        for _, ts in tqdm(enumerate(scheduler.timesteps)):
-            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-            latent_model_input = scheduler.scale_model_input(torch.cat([latents] * 2), ts) # pylint: disable=no-member
+        # Loop
+        with autocast("cuda"):
+            for _, ts in tqdm(enumerate(scheduler.timesteps)):
+                # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+                latent_model_input = scheduler.scale_model_input(torch.cat([latents] * 2), ts) # pylint: disable=no-member
 
-            # predict the noise residual
-            with torch.no_grad():
-                noise_pred = unet(latent_model_input, ts, encoder_hidden_states=text_embeddings).sample
+                # predict the noise residual
+                with torch.no_grad():
+                    noise_pred = unet(latent_model_input, ts, encoder_hidden_states=text_embeddings).sample
 
-            # perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
+                # perform guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            # latents = scheduler.step(noise_pred, i, latents)["prev_sample"] # Diffusers 0.3 and below
-            latents = scheduler.step(noise_pred, ts, latents).prev_sample
+                # compute the previous noisy sample x_t -> x_t-1
+                # latents = scheduler.step(noise_pred, i, latents)["prev_sample"] # Diffusers 0.3 and below
+                latents = scheduler.step(noise_pred, ts, latents).prev_sample
 
-    # scale and decode the image latents with vae
-    latents = 1 / 0.18215 * latents
-    with torch.no_grad():
-        image = vae.decode(latents).sample
+        # scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
+        with torch.no_grad():
+            image = vae.decode(latents).sample
 
-    # Display
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-    images = (image * 255).round().astype("uint8")
+        # Display
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+        images = (image * 255).round().astype("uint8")
 
-    out = Image.fromarray(images[0])
+        return images[0]
+    finally:
+        GPUS[gpu].release()
+
+def safe_generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5, nsfw=False):
+    ''' Generate an image and check NSFW. Returns a FastAPI StreamingResponse. '''
+
+    image = generate_image(prompt, seed, steps, width, height, guidance)
+
+    if not nsfw and naughty(image):
+        print("🍆 detected!!!1!")
+        prompt = "An adorable teddy bear running through a grassy field, early morning volumetric lighting"
+        image = generate_image(prompt, seed, steps, width, height, guidance)
+
+    out = Image.fromarray(image)
 
     # Set the EXIF data. See PIL.ExifTags.TAGS to map numbers to names.
     exif = out.getexif()
@@ -158,7 +187,6 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
 
     buf = BytesIO()
     out.save(buf, format="JPEG", quality=85, exif=exif)
-
     buf.seek(0)
 
     return StreamingResponse(buf, media_type="image/jpeg", headers={
@@ -177,22 +205,14 @@ async def generate(
     steps: Optional[int] = Query(40),
     width: Optional[int] = Query(512),
     height: Optional[int] = Query(512),
+    guidance: Optional[float] = Query(7.5),
+    nsfw: Optional[bool] = Query(False),
     ):
     ''' Generate an image with Stable Diffusion '''
-
-    if width * height > 287744:
-        raise HTTPException(
-            status_code=422,
-            detail='Out of GPU memory. Total width * height must be < 287744 pixels.'
-        )
 
     if seed < 0:
         seed = random.randint(0,2**64-1)
 
     prompt = prompt.strip().replace('\n', ' ')
 
-    gpu = wait_for_gpu()
-    try:
-        return generate_image(prompt, seed, steps, width, height)
-    finally:
-        GPUS[gpu]['lock'].release()
+    return safe_generate_image(prompt, seed, steps, width, height, guidance, nsfw)
