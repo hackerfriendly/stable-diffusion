@@ -3,9 +3,10 @@ sdd.py: Stable Diffusion daemon. Pre-load the model and serve image prompts via 
 
 This fetches SD from Hugging Face, so huggingface-cli login first.
 
-Reduces rendering time about 3.5 seconds for 40 steps on an RTX 2080.
+Reduces rendering time to about 8 it/s (~5 seconds for 40 steps) for 512x512 on an RTX 2080.
 '''
 import random
+import gc
 
 from threading import Lock
 from typing import Optional
@@ -13,7 +14,7 @@ from io import BytesIO
 
 import torch
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
 
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, logging
@@ -62,14 +63,14 @@ if not GPUS:
 logging.set_verbosity_error()
 
 # Load the autoencoder model which will be used to decode the latents into image space.
-vae = AutoencoderKL.from_pretrained(MODELS["vae"]["name"], subfolder=MODELS["vae"]["sub"], use_auth_token=True)
+vae = AutoencoderKL.from_pretrained(MODELS["vae"]["name"], subfolder=MODELS["vae"]["sub"], use_auth_token=True).half()
 
 # Load the tokenizer and text encoder to tokenize and encode the text.
 tokenizer = CLIPTokenizer.from_pretrained(MODELS["tokenizer"]["name"], subfolder=MODELS["tokenizer"]["sub"])
 text_encoder = CLIPTextModel.from_pretrained(MODELS["text_encoder"]["name"], subfolder=MODELS["text_encoder"]["sub"])
 
 # The UNet model for generating the latents.
-unet = UNet2DConditionModel.from_pretrained(MODELS["unet"]["name"], subfolder=MODELS["unet"]["sub"], use_auth_token=True)
+unet = UNet2DConditionModel.from_pretrained(MODELS["unet"]["name"], subfolder=MODELS["unet"]["sub"], use_auth_token=True).half()
 
 # The CompVis safety model.
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(MODELS["safety"]["name"], subfolder=MODELS["safety"]["sub"])
@@ -101,10 +102,22 @@ def wait_for_gpu():
         if GPUS[gpu].acquire(timeout=0.5):
             return gpu
 
+def clear_cuda_mem():
+    ''' Try to recover from CUDA OOM '''
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                del obj
+        except Exception as e:
+            pass
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
     ''' Generate and return an image array using the first available GPU '''
-
     gpu = wait_for_gpu()
+
     try:
         # Prep text
         text_input = tokenizer(
@@ -123,7 +136,6 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
         with torch.no_grad():
             uncond_embeddings = text_encoder(uncond_input.input_ids.to('cuda'))[0]
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # pylint: disable=no-member
-
         # Prep Scheduler
         scheduler.set_timesteps(steps)
 
@@ -131,7 +143,7 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
         latents = torch.randn( # pylint: disable=no-member
           (1, unet.in_channels, height // 8, width // 8),
           generator=torch.manual_seed(seed),
-        )
+        ).half()
         latents = latents.to('cuda')
         latents = latents * scheduler.init_noise_sigma
 
@@ -150,7 +162,6 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
                 noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                # latents = scheduler.step(noise_pred, i, latents)["prev_sample"] # Diffusers 0.3 and below
                 latents = scheduler.step(noise_pred, ts, latents).prev_sample
 
         # scale and decode the image latents with vae
@@ -164,15 +175,24 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
         images = (image * 255).round().astype("uint8")
 
         return images[0]
+
+    except RuntimeError:
+        # print(torch.cuda.memory_summary(device=None, abbreviated=False))
+        raise HTTPException(
+            status_code=507,
+            detail="Out of CUDA memory. Try smaller values for width and height."
+        )
+
     finally:
+        clear_cuda_mem()
         GPUS[gpu].release()
 
-def safe_generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5, nsfw=False):
+def safe_generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5, safe=True):
     ''' Generate an image and check NSFW. Returns a FastAPI StreamingResponse. '''
 
     image = generate_image(prompt, seed, steps, width, height, guidance)
 
-    if not nsfw and naughty(image):
+    if safe and naughty(image):
         print("🍆 detected!!!1!")
         prompt = "An adorable teddy bear running through a grassy field, early morning volumetric lighting"
         image = generate_image(prompt, seed, steps, width, height, guidance)
@@ -202,11 +222,11 @@ async def root():
 async def generate(
     prompt: Optional[str] = Query(""),
     seed: Optional[int] = Query(-1),
-    steps: Optional[int] = Query(40),
+    steps: Optional[int] = Query(ge=1, le=100, default=40),
     width: Optional[int] = Query(512),
     height: Optional[int] = Query(512),
     guidance: Optional[float] = Query(7.5),
-    nsfw: Optional[bool] = Query(False),
+    safe: Optional[bool] = Query(True),
     ):
     ''' Generate an image with Stable Diffusion '''
 
@@ -215,4 +235,6 @@ async def generate(
 
     prompt = prompt.strip().replace('\n', ' ')
 
-    return safe_generate_image(prompt, seed, steps, width, height, guidance, nsfw)
+    torch.cuda.empty_cache()
+
+    return safe_generate_image(prompt, seed, steps, width, height, guidance, safe)
