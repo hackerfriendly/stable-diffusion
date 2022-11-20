@@ -161,6 +161,16 @@ def generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5):
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
 
+                # See Fast.AI lesson 11
+
+                # Traditional:
+                #   pred_nonscaled = u + g *(t-u)
+
+                # Improved:
+                #   pred = pred_nonscaled * torch.norm(u)/torch.norm(pred_nonscaled)
+
+                noise_pred = noise_pred * torch.norm(noise_pred_uncond) / torch.norm(noise_pred)
+
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = scheduler.step(noise_pred, ts, latents).prev_sample
 
