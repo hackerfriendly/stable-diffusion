@@ -15,7 +15,7 @@ from io import BytesIO
 import torch
 
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, LMSDiscreteScheduler
@@ -213,13 +213,13 @@ def safe_generate_image(prompt, seed, steps, width=512, height=512, guidance=7.5
         'Content-Disposition': 'inline; filename="synthesis.jpg"'}
     )
 
-@app.get("/")
+@app.get("/", status_code=302)
 async def root():
     ''' Hi there! '''
-    return {"message": "Stable Diffusion server. Try /docs"}
+    return RedirectResponse("/docs")
 
 @app.post("/generate/")
-async def generate(
+def generate(
     prompt: Optional[str] = Query(""),
     seed: Optional[int] = Query(-1),
     steps: Optional[int] = Query(ge=1, le=100, default=40),
