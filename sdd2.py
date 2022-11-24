@@ -92,7 +92,15 @@ def generate_image(prompt, seed, steps, width=768, height=768, guidance=15):
 
     try:
         generator = torch.Generator(device='cuda').manual_seed(seed)
-        return pipe(prompt, generator=generator, num_inference_steps=steps, height=height, width=width, guidance_scale=guidance).images[0]
+        return pipe(
+            prompt,
+            negative_prompt="meme youtube 'play button' 'computer graphics' caption",
+            generator=generator,
+            num_inference_steps=steps,
+            height=height,
+            width=width,
+            guidance_scale=guidance
+        ).images[0]
 
     except RuntimeError:
         # print(torch.cuda.memory_summary(device=None, abbreviated=False))
