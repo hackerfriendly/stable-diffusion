@@ -14,6 +14,7 @@ from typing import Optional
 from io import BytesIO
 
 import torch
+import numpy as np
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse, RedirectResponse
@@ -37,7 +38,6 @@ MODELS = {
     },
     "safety": {
         "name": "CompVis/stable-diffusion-safety-checker",
-        "sub": ""
     }
 }
 
@@ -53,8 +53,8 @@ if not GPUS:
 logging.set_verbosity_error()
 
 # The CompVis safety model.
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(MODELS["safety"]["name"], subfolder=MODELS["safety"]["sub"])
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(MODELS["safety"]["name"], subfolder=MODELS["safety"]["sub"])
+safety_feature_extractor = AutoFeatureExtractor.from_pretrained(MODELS["safety"]["name"])
+safety_checker = StableDiffusionSafetyChecker.from_pretrained(MODELS["safety"]["name"])
 
 # Use the Euler scheduler here instead
 scheduler = EulerDiscreteScheduler.from_pretrained(MODELS["pipeline"]["name"], subfolder="scheduler")
@@ -63,8 +63,9 @@ pipe = pipe.to("cuda")
 
 def naughty(image):
     ''' Returns True if naughty bits are detected, else False. '''
-    safety_checker_input = safety_feature_extractor([image], return_tensors="pt")
-    _, has_nsfw_concept = safety_checker(images=[image], clip_input=safety_checker_input.pixel_values)
+    imgarray = np.asarray(image)
+    safety_checker_input = safety_feature_extractor([imgarray], return_tensors="pt")
+    _, has_nsfw_concept = safety_checker(images=[imgarray], clip_input=safety_checker_input.pixel_values)
     return has_nsfw_concept[0]
 
 def wait_for_gpu():
