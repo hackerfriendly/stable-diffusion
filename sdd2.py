@@ -33,7 +33,8 @@ app = FastAPI()
 
 MODELS = {
     "pipeline": {
-        "name": "stabilityai/stable-diffusion-2",
+        # "name": "stabilityai/stable-diffusion-2",
+        "name": "stabilityai/stable-diffusion-2-1",
         "sub": ""
     },
     "safety": {
